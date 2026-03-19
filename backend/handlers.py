@@ -4,24 +4,25 @@ handlers.py
 One async generator per intent. Each yields str tokens then optionally
 a dict with metadata (sources, next_action, etc.).
 
-- handle_qa       : LIVE — calls RAG pipeline (Phase 1)
-- handle_schedule : STUB — Phase 3 will replace this
-- handle_ticket   : STUB — Phase 3 will replace this
-- handle_escalate : STUB — Phase 4 will replace this
+- handle_qa       : LIVE — calls RAG pipeline
+- handle_schedule : AGENTIC — LLM drives the booking via tool calls
+- handle_ticket   : AGENTIC — LLM drives ticket creation via tool calls
+- handle_escalate : routes user to human support
 """
 
-import sys, os, random, string
+import sys, os, random, string, json
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'rag_pipeline'))
 
+import openai
 from rag_pipeline.query import answer_stream as rag_stream
-from rag_pipeline.embedder import embed_query
-from rag_pipeline.db import search
+from rag_pipeline.config import OPENAI_API_KEY, OPENAI_MODEL
 
-
-from email_service   import send_ticket_email, send_demo_email
+from email_service    import send_ticket_email, send_demo_email
 from calendar_service import get_available_slots
-from session         import get_handler_state, set_handler_state, clear_handler_state
+from session          import get_handler_state, set_handler_state, clear_handler_state
+
+_client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -35,11 +36,8 @@ def _words(text: str):
     for word in text.split(" "):
         yield word + " "
 
-def _is_valid_email(email: str) -> bool:
-    return "@" in email and "." in email.split("@")[-1]
 
-
-# ── QA handler (unchanged from Phase 2) ──────────────────────────────────────
+# ── QA handler (unchanged) ────────────────────────────────────────────────────
 
 async def handle_qa(question: str, history: list[dict], session_id: str = None):
     sources = []
@@ -55,222 +53,247 @@ async def handle_qa(question: str, history: list[dict], session_id: str = None):
         yield {"sources": []}
 
 
-# ── Schedule handler (multi-turn) ─────────────────────────────────────────────
+# ── Agentic runner ────────────────────────────────────────────────────────────
+
+async def _run_agent(
+    session_id: str,
+    intent: str,
+    system_prompt: str,
+    tools: list[dict],
+    tool_executor,        # fn(name: str, args: dict) -> (result: dict, is_terminal: bool)
+    question: str,
+):
+    """
+    Drives an agentic tool-calling loop. Yields text tokens as the LLM speaks,
+    calls tools autonomously, and loops until the LLM produces a plain text
+    response (no tool calls). Saves / clears session state automatically.
+    """
+    state = get_handler_state(session_id, intent) if session_id else {}
+    messages = list(state.get("messages", []))
+    messages.append({"role": "user", "content": question})
+
+    terminal_called = False
+
+    while True:
+        stream = await _client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": system_prompt}] + messages,
+            tools=tools,
+            tool_choice="auto",
+            stream=True,
+        )
+
+        text = ""
+        tool_calls_acc: dict[int, dict] = {}
+
+        async for chunk in stream:
+            delta = chunk.choices[0].delta
+
+            if delta.content:
+                text += delta.content
+                yield delta.content
+
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    i = tc.index
+                    if i not in tool_calls_acc:
+                        tool_calls_acc[i] = {"id": "", "name": "", "arguments": ""}
+                    if tc.id:
+                        tool_calls_acc[i]["id"] = tc.id
+                    if tc.function:
+                        if tc.function.name:
+                            tool_calls_acc[i]["name"] += tc.function.name
+                        if tc.function.arguments:
+                            tool_calls_acc[i]["arguments"] += tc.function.arguments
+
+        if tool_calls_acc:
+            # Append assistant message that requested the tool calls
+            messages.append({
+                "role": "assistant",
+                "content": text or None,
+                "tool_calls": [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                    }
+                    for tc in tool_calls_acc.values()
+                ],
+            })
+
+            # Execute each tool and feed results back
+            for tc in tool_calls_acc.values():
+                try:
+                    args = json.loads(tc["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+
+                result, is_terminal = tool_executor(tc["name"], args)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": json.dumps(result),
+                })
+                if is_terminal:
+                    terminal_called = True
+
+            # Loop — let the LLM respond to the tool results
+
+        else:
+            # LLM produced a plain text response; conversation turn is complete
+            messages.append({"role": "assistant", "content": text})
+
+            if terminal_called:
+                if session_id:
+                    clear_handler_state(session_id, intent)
+                yield {"sources": [], "next_action": "done"}
+            else:
+                if session_id:
+                    set_handler_state(session_id, intent, {"messages": messages})
+                yield {"sources": []}
+            return
+
+
+# ── Schedule handler (agentic) ────────────────────────────────────────────────
+
+_SCHEDULE_SYSTEM = """\
+You are a friendly demo booking assistant for Alchemyst AI.
+
+Your goal: book a product demo for the user by collecting:
+  - Email address  (required — needed to send confirmation)
+  - A time slot    (required — fetch options with get_available_slots first)
+  - Name           (optional — if the user skips or refuses, use "there")
+
+Rules:
+- Be conversational and flexible. Do NOT follow a rigid script.
+- If the user has already provided information in the conversation, do not ask again.
+- If the user declines to share their name, acknowledge it and proceed without it.
+- Always call get_available_slots before presenting times so the list is live.
+- Once you have the email and a chosen slot, call send_demo_email immediately.
+- After send_demo_email returns, confirm the booking warmly to the user.\
+"""
+
+_SCHEDULE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_available_slots",
+            "description": "Fetch live available demo time slots from the calendar.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_demo_email",
+            "description": (
+                "Book the demo and send a confirmation email to the user. "
+                "Call this once you have the user's email and chosen slot."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name":       {"type": "string", "description": "Customer name. Use 'there' if not provided."},
+                    "email":      {"type": "string", "description": "Customer email address."},
+                    "slot_label": {"type": "string", "description": "Human-readable slot label from get_available_slots."},
+                },
+                "required": ["name", "email", "slot_label"],
+            },
+        },
+    },
+]
+
+
+def _schedule_executor(name: str, args: dict) -> tuple[dict, bool]:
+    if name == "get_available_slots":
+        slots = get_available_slots()
+        return {"slots": slots}, False
+
+    if name == "send_demo_email":
+        ok = send_demo_email(
+            name=args.get("name", "there"),
+            email=args.get("email", ""),
+            slot=args.get("slot_label", ""),
+        )
+        return {"success": ok}, True
+
+    return {"error": f"Unknown tool: {name}"}, False
+
 
 async def handle_schedule(question: str, history: list[dict], session_id: str = None):
-    """
-    Turn-by-turn flow:
-      start       → ask for name
-      collect_name  → ask for email
-      collect_email → fetch slots → show options
-      collect_slot  → confirm → send emails → done
-    """
-    state = get_handler_state(session_id, "schedule") if session_id else {}
-    step  = state.get("step", "start")
-    data  = state.get("data", {})
+    async for chunk in _run_agent(
+        session_id, "schedule",
+        _SCHEDULE_SYSTEM, _SCHEDULE_TOOLS,
+        _schedule_executor, question,
+    ):
+        yield chunk
 
-    # ── start: greet and ask for name ────────────────────────────────────────
-    if step == "start":
-        set_handler_state(session_id, "schedule", {"step": "collect_name", "data": {}})
-        msg = "I'd love to help you book a demo! 📅\n\nFirst, could you share your **full name**?"
-        for w in _words(msg): yield w
-        yield {"sources": [], "next_action": "collect_name"}
-        return
 
-    # ── collect name → ask for email ─────────────────────────────────────────
-    if step == "collect_name":
-        name = question.strip().title()
-        data["name"] = name
-        set_handler_state(session_id, "schedule", {"step": "collect_email", "data": data})
-        msg = f"Nice to meet you, **{name}**! What's the best email address to send your confirmation to?"
-        for w in _words(msg): yield w
-        yield {"sources": [], "next_action": "collect_email"}
-        return
+# ── Ticket handler (agentic) ──────────────────────────────────────────────────
 
-    # ── collect email → fetch slots ───────────────────────────────────────────
-    if step == "collect_email":
-        email = question.strip().lower()
-        if not _is_valid_email(email):
-            msg = "That doesn't look like a valid email. Could you double-check and try again?"
-            for w in _words(msg): yield w
-            yield {"sources": []}
-            return
+_TICKET_SYSTEM = """\
+You are a helpful support ticket assistant for Alchemyst AI.
 
-        data["email"] = email
-        # Fetch real slots from Google Calendar
-        slots = get_available_slots()
+Your goal: raise a support ticket for the user by collecting:
+  - Email address       (required — for follow-up)
+  - Issue description   (required — ask for detail if the message is vague)
+  - Name                (optional — use "Customer" if not provided)
 
-        if not slots:
-            set_handler_state(session_id, "schedule", {"step": "start", "data": {}})
-            msg = (
-                "I wasn't able to find any open slots right now. "
-                "Please email us directly at sales@yourcompany.com and we'll sort something out!"
-            )
-            for w in _words(msg): yield w
-            yield {"sources": []}
-            return
+Rules:
+- Be empathetic and flexible. Do NOT follow a rigid script.
+- If the user has already described their issue, do not ask them to repeat it.
+- If the user skips their name, proceed without it.
+- Once you have the email and a clear description, call create_support_ticket immediately.
+- After the tool returns, share the ticket ID and confirm the next steps.\
+"""
 
-        data["slots"] = slots
-        set_handler_state(session_id, "schedule", {"step": "collect_slot", "data": data})
+_TICKET_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "create_support_ticket",
+            "description": (
+                "Log a support ticket and send confirmation emails. "
+                "Call this once you have the user's email and issue description."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name":        {"type": "string", "description": "Customer name. Use 'Customer' if not provided."},
+                    "email":       {"type": "string", "description": "Customer email address."},
+                    "description": {"type": "string", "description": "Detailed description of the issue."},
+                },
+                "required": ["name", "email", "description"],
+            },
+        },
+    },
+]
 
-        slot_lines = "\n".join(
-            f"  **{i+1}.** {s['label']}" for i, s in enumerate(slots)
+
+def _ticket_executor(name: str, args: dict) -> tuple[dict, bool]:
+    if name == "create_support_ticket":
+        ticket_id = _ticket_id()
+        ok = send_ticket_email(
+            ticket_id=ticket_id,
+            name=args.get("name", "Customer"),
+            email=args.get("email", ""),
+            description=args.get("description", ""),
         )
-        msg = (
-            f"Here are the next available slots:\n\n"
-            f"{slot_lines}\n\n"
-            f"Reply with **1**, **2**, or **3** to pick your preferred time."
-        )
-        for w in _words(msg): yield w
-        yield {"sources": [], "next_action": "collect_slot"}
-        return
+        return {"success": ok, "ticket_id": ticket_id}, True
 
-    # ── collect slot choice → confirm + send emails ───────────────────────────
-    if step == "collect_slot":
-        choice = question.strip()
-        slots  = data.get("slots", [])
-        name   = data.get("name", "there")
-        email  = data.get("email", "")
+    return {"error": f"Unknown tool: {name}"}, False
 
-        # Accept "1", "2", "3" or just pick first if unclear
-        idx = None
-        if choice in ("1", "2", "3"):
-            idx = int(choice) - 1
-        else:
-            # Try to match slot label
-            for i, s in enumerate(slots):
-                if any(w in choice.lower() for w in s["label"].lower().split()):
-                    idx = i
-                    break
-
-        if idx is None or idx >= len(slots):
-            slot_lines = "\n".join(f"  **{i+1}.** {s['label']}" for i, s in enumerate(slots))
-            msg = f"Please reply with **1**, **2**, or **3**:\n\n{slot_lines}"
-            for w in _words(msg): yield w
-            yield {"sources": []}
-            return
-
-        chosen = slots[idx]
-        ok     = send_demo_email(name, email, chosen["label"])
-        clear_handler_state(session_id, "schedule")
-
-        if ok:
-            msg = (
-                f"You're all set, **{name}**! 🎉\n\n"
-                f"Your demo is booked for **{chosen['label']}**. "
-                f"We've sent a confirmation to **{email}** — our team will follow up with a calendar invite shortly."
-            )
-        else:
-            msg = (
-                f"Your slot **{chosen['label']}** is noted, but I had trouble sending the confirmation email. "
-                f"Our team will reach out to **{email}** to confirm."
-            )
-
-        for w in _words(msg): yield w
-        yield {"sources": [], "next_action": "done"}
-        return
-
-    # Fallback: restart
-    clear_handler_state(session_id, "schedule")
-    for w in _words("Let's start over. What's your **full name**?"): yield w
-    yield {"sources": []}
-
-
-# ── Ticket handler (multi-turn) ───────────────────────────────────────────────
 
 async def handle_ticket(question: str, history: list[dict], session_id: str = None):
-    """
-    Turn-by-turn flow:
-      start          → ask for name
-      collect_name   → ask for email
-      collect_email  → ask for issue description
-      collect_issue  → generate ticket ID → send email → done
-    """
-    state = get_handler_state(session_id, "ticket") if session_id else {}
-    step  = state.get("step", "start")
-    data  = state.get("data", {})
-
-    # ── start ─────────────────────────────────────────────────────────────────
-    if step == "start":
-        set_handler_state(session_id, "ticket", {"step": "collect_name", "data": {}})
-        msg = (
-            "I'm sorry to hear you're having trouble. I'll get this logged right away. 🎫\n\n"
-            "Could you start by sharing your **full name**?"
-        )
-        for w in _words(msg): yield w
-        yield {"sources": [], "next_action": "collect_name"}
-        return
-
-    # ── collect name ──────────────────────────────────────────────────────────
-    if step == "collect_name":
-        name = question.strip().title()
-        data["name"] = name
-        set_handler_state(session_id, "ticket", {"step": "collect_email", "data": data})
-        msg = f"Thanks, **{name}**. What's your **email address** so we can follow up with you?"
-        for w in _words(msg): yield w
-        yield {"sources": [], "next_action": "collect_email"}
-        return
-
-    # ── collect email ─────────────────────────────────────────────────────────
-    if step == "collect_email":
-        email = question.strip().lower()
-        if not _is_valid_email(email):
-            msg = "That doesn't look like a valid email. Could you double-check and re-enter it?"
-            for w in _words(msg): yield w
-            yield {"sources": []}
-            return
-
-        data["email"] = email
-        set_handler_state(session_id, "ticket", {"step": "collect_issue", "data": data})
-        msg = (
-            "Got it. Now, please describe the issue you're experiencing in as much detail as you can — "
-            "including any error messages or steps to reproduce it."
-        )
-        for w in _words(msg): yield w
-        yield {"sources": [], "next_action": "collect_issue"}
-        return
-
-    # ── collect issue → send ticket ───────────────────────────────────────────
-    if step == "collect_issue":
-        description = question.strip()
-
-        if len(description) < 10:
-            msg = "Could you give a bit more detail about the issue? The more context, the faster our team can help."
-            for w in _words(msg): yield w
-            yield {"sources": []}
-            return
-
-        name      = data.get("name", "Customer")
-        email     = data.get("email", "")
-        ticket_id = _ticket_id()
-
-        ok = send_ticket_email(ticket_id, name, email, description)
-        clear_handler_state(session_id, "ticket")
-
-        if ok:
-            msg = (
-                f"Your ticket has been raised! ✅\n\n"
-                f"**Ticket ID:** `{ticket_id}`\n\n"
-                f"We've sent a confirmation to **{email}** and our support team will get back to you within **24 hours**. "
-                f"Please keep your ticket ID handy for reference."
-            )
-        else:
-            msg = (
-                f"Your issue has been noted (ref: `{ticket_id}`), but I had trouble sending the email notification. "
-                f"Please also email us directly at support@yourcompany.com quoting this reference."
-            )
-
-        for w in _words(msg): yield w
-        yield {"sources": [], "next_action": "done"}
-        return
-
-    # Fallback
-    clear_handler_state(session_id, "ticket")
-    for w in _words("Let's start over. What's your **full name**?"): yield w
-    yield {"sources": []}
+    async for chunk in _run_agent(
+        session_id, "ticket",
+        _TICKET_SYSTEM, _TICKET_TOOLS,
+        _ticket_executor, question,
+    ):
+        yield chunk
 
 
-# ── Escalate handler (stub — Phase 4 will enhance) ────────────────────────────
+# ── Escalate handler ──────────────────────────────────────────────────────────
 
 async def handle_escalate(question: str, history: list[dict], session_id: str = None):
     msg = (
