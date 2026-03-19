@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: chatbot-api
+    runtime: python
+    buildCommand: |
+      pip install -r backend/requirements.txt
+      playwright install chromium --with-deps
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: SMTP_EMAIL
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: EMAIL_SUPPORT
+        sync: false
+      - key: EMAIL_DEMO
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: GOOGLE_CALENDAR_ID
+        sync: false
+      - key: CALENDAR_TIMEZONE
+        value: Asia/Kolkata
+      - key: PYTHON_VERSION
+        value: 3.11.0
